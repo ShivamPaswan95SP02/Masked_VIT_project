@@ -7,13 +7,12 @@ from torchvision import datasets, transforms
 import numpy as np
 from einops import rearrange
 
-# Hyperparameters
+# Default Hyperparameters (can be overridden from sidebar)
 BUFFER_SIZE = 1024
 BATCH_SIZE = 256
-IMAGE_SIZE = 48
-PATCH_SIZE = 6
-NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2
-MASK_PROPORTION = 0.75
+DEFAULT_IMAGE_SIZE = 48
+DEFAULT_PATCH_SIZE = 6
+MASK_PROPORTION = 0.55
 ENC_PROJECTION_DIM = 128
 DEC_PROJECTION_DIM = 64
 ENC_NUM_HEADS = 4
@@ -27,10 +26,11 @@ LAYER_NORM_EPS = 1e-6
 
 # Data Augmentation
 class TrainAugmentation(nn.Module):
-    def __init__(self):
+    def __init__(self, image_size):
         super().__init__()
-        self.resize = transforms.Resize((32 + 20, 32 + 20))
-        self.random_crop = transforms.RandomCrop((IMAGE_SIZE, IMAGE_SIZE))
+        self.image_size = image_size
+        self.resize = transforms.Resize((image_size + 20, image_size + 20))
+        self.random_crop = transforms.RandomCrop((image_size, image_size))
         self.random_flip = transforms.RandomHorizontalFlip()
 
     def forward(self, x):
@@ -40,9 +40,10 @@ class TrainAugmentation(nn.Module):
         return x
 
 class TestAugmentation(nn.Module):
-    def __init__(self):
+    def __init__(self, image_size):
         super().__init__()
-        self.resize = transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))
+        self.image_size = image_size
+        self.resize = transforms.Resize((image_size, image_size))
 
     def forward(self, x):
         x = self.resize(x)
@@ -50,7 +51,7 @@ class TestAugmentation(nn.Module):
 
 # Patches Layer
 class Patches(nn.Module):
-    def __init__(self, patch_size=PATCH_SIZE):
+    def __init__(self, patch_size):
         super().__init__()
         self.patch_size = patch_size
 
@@ -71,17 +72,17 @@ class Patches(nn.Module):
 
 # Patch Encoder
 class PatchEncoder(nn.Module):
-    def __init__(self, patch_size=PATCH_SIZE, projection_dim=ENC_PROJECTION_DIM,
-                 mask_proportion=MASK_PROPORTION, downstream=False):  # Make mask_proportion a parameter
+    def __init__(self, patch_size, num_patches, projection_dim, mask_proportion, downstream=False):
         super().__init__()
         self.patch_size = patch_size
+        self.num_patches = num_patches
         self.projection_dim = projection_dim
-        self.mask_proportion = mask_proportion  # Use the passed value
+        self.mask_proportion = mask_proportion
         self.downstream = downstream
 
         self.mask_token = nn.Parameter(torch.randn(1, patch_size * patch_size * 3))
         self.projection = nn.Linear(patch_size * patch_size * 3, projection_dim)
-        self.position_embedding = nn.Embedding(NUM_PATCHES, projection_dim)
+        self.position_embedding = nn.Embedding(num_patches, projection_dim)
 
     def forward(self, patches):
         batch_size, num_patches, _ = patches.shape
@@ -114,12 +115,11 @@ class PatchEncoder(nn.Module):
                     unmasked_positions, mask_indices, unmask_indices)
 
     def generate_masked_image(self, patches, unmask_indices):
-        # Select first item in batch (since we're displaying one at a time)
-        patch = patches[0]  # Get first item in batch
-        unmask_index = unmask_indices[0]  # Get first item in batch
+        patch = patches[0]
+        unmask_index = unmask_indices[0]
         new_patch = torch.zeros_like(patch)
         new_patch[unmask_index] = patch[unmask_index]
-        return new_patch, 0  # Return index 0 since we're working with first item
+        return new_patch, 0
 
 # Encoder
 class Encoder(nn.Module):
@@ -153,7 +153,7 @@ class Encoder(nn.Module):
 
 # Decoder
 class Decoder(nn.Module):
-    def __init__(self, num_layers=DEC_LAYERS, num_heads=DEC_NUM_HEADS, image_size=IMAGE_SIZE):
+    def __init__(self, num_patches, image_size, num_layers=DEC_LAYERS, num_heads=DEC_NUM_HEADS):
         super().__init__()
         self.proj = nn.Linear(ENC_PROJECTION_DIM, DEC_PROJECTION_DIM)
         self.layers = nn.ModuleList()
@@ -175,7 +175,7 @@ class Decoder(nn.Module):
 
         self.norm = nn.LayerNorm(DEC_PROJECTION_DIM, eps=LAYER_NORM_EPS)
         self.head = nn.Sequential(
-            nn.Linear(DEC_PROJECTION_DIM * NUM_PATCHES, image_size * image_size * 3),
+            nn.Linear(DEC_PROJECTION_DIM * num_patches, image_size * image_size * 3),
             nn.Sigmoid()
         )
         self.image_size = image_size
@@ -235,26 +235,36 @@ class MaskedAutoencoder(nn.Module):
     def forward(self, x):
         return self.calculate_loss(x)
 
-# In the main() function, update the sidebar controls section:
 def main():
-    # Streamlit app configuration
     st.set_page_config(layout="wide")
     st.title("Masked Autoencoder (MAE) with PyTorch")
 
     # Sidebar controls
     with st.sidebar:
         st.header("Configuration")
-
-        batch_size = st.slider("Batch Size", 32, 512, BATCH_SIZE, step=32) 
-        epochs = st.sidebar.number_input("Number of Epochs", min_value=1, max_value=1000, value=10)
         
-        # Add slider for mask proportion
-        mask_proportion = st.slider("Masking Proportion", 
-                                  min_value=0.1, 
-                                  max_value=0.9, 
-                                  value=MASK_PROPORTION, 
-                                  step=0.05,
-                                  help="Proportion of patches to mask")
+        image_size = st.number_input("Image Size",min_value=8, max_value=100, value=48)
+        patch_size = st.number_input("Patch Size",min_value=2, max_value=16, value=6)
+        
+        # Validate patch size
+        if image_size % patch_size != 0:
+            st.warning(f"Patch size {patch_size} doesn't divide evenly into image size {image_size}.")
+            # Find compatible patch sizes
+            divisors = [i for i in range(4, min(17, image_size+1)) if image_size % i == 0]
+            if divisors:
+                new_patch_size = min(divisors, key=lambda x: abs(x - patch_size))
+                patch_size = new_patch_size
+                st.info(f"Using compatible patch size: {patch_size}")
+            else:
+                st.error("No valid patch size found. Using default.")
+                patch_size = DEFAULT_PATCH_SIZE
+
+        num_patches = (image_size // patch_size) ** 2
+        st.info(f"Number of patches: {num_patches}")
+
+        batch_size = st.slider("Batch Size", 32, 512, BATCH_SIZE, step=32)
+        epochs = st.number_input("Number of Epochs", min_value=1, max_value=1000, value=10)
+        mask_proportion = st.slider("Masking Proportion", 0.1, 0.9, MASK_PROPORTION, step=0.05)
 
         if st.button("Train Model"):
             train_model = True
@@ -275,20 +285,20 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Initialize models - pass the mask_proportion from sidebar
+    # Initialize models
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_augmentation = TrainAugmentation().to(device)
-    test_augmentation = TestAugmentation().to(device)
-    patch_layer = Patches().to(device)
-    patch_encoder = PatchEncoder(mask_proportion=mask_proportion).to(device)  # Updated here
+    
+    train_augmentation = TrainAugmentation(image_size).to(device)
+    test_augmentation = TestAugmentation(image_size).to(device)
+    patch_layer = Patches(patch_size).to(device)
+    patch_encoder = PatchEncoder(patch_size, num_patches, ENC_PROJECTION_DIM, mask_proportion).to(device)
     encoder = Encoder().to(device)
-    decoder = Decoder().to(device)
+    decoder = Decoder(num_patches, image_size).to(device)
 
     mae_model = MaskedAutoencoder(
         train_augmentation, test_augmentation,
         patch_layer, patch_encoder, encoder, decoder
     ).to(device)
-
 
     optimizer = torch.optim.Adam(mae_model.parameters())
 
@@ -386,7 +396,7 @@ def main():
         st.subheader("Sample Data Visualization")
         sample_images, _ = next(iter(train_loader))
         sample_images = sample_images[:5]
-
+ 
         cols = st.columns(5)
         for i in range(5):
             with cols[i]:
