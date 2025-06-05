@@ -1,399 +1,344 @@
-import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
 import numpy as np
-from einops import rearrange
+from einops import rearrange, repeat
 
-# Hyperparameters
-BUFFER_SIZE = 1024
-BATCH_SIZE = 256
-IMAGE_SIZE = 48
-PATCH_SIZE = 6
-NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2
-MASK_PROPORTION = 0.75
-ENC_PROJECTION_DIM = 128
-DEC_PROJECTION_DIM = 64
-ENC_NUM_HEADS = 4
-ENC_LAYERS = 6
-DEC_NUM_HEADS = 4
-DEC_LAYERS = 2
-ENC_TRANSFORMER_UNITS = [ENC_PROJECTION_DIM * 2, ENC_PROJECTION_DIM]
-DEC_TRANSFORMER_UNITS = [DEC_PROJECTION_DIM * 2, DEC_PROJECTION_DIM]
-EPOCHS = 50
-LAYER_NORM_EPS = 1e-6
+# Set random seed for reproducibility
+torch.manual_seed(42)
 
-# Data Augmentation
-class TrainAugmentation(nn.Module):
-    def __init__(self):
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load MNIST dataset
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+
+full_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+
+# Split into train, validation, test (80%, 10%, 10%)
+train_size = int(0.8 * len(full_dataset))
+val_size = int(0.1 * len(full_dataset))
+test_size = len(full_dataset) - train_size - val_size
+
+train_dataset, val_dataset, test_dataset = random_split(
+    full_dataset, [train_size, val_size, test_size]
+)
+
+# Test dataset (official test set)
+official_test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+
+# Create data loaders
+batch_size = 64
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+official_test_loader = DataLoader(official_test_dataset, batch_size=batch_size, shuffle=False)
+
+# Parameters
+patch_size = 7
+embed_dim = 128
+num_heads = 4
+num_layers = 3
+
+# Streamlit app
+st.title("Masked Autoencoder Vision Transformer (MAE ViT)")
+
+# Sidebar for parameters
+st.sidebar.header("Model Parameters")
+image_size = st.sidebar.number_input("Image Size", min_value=1, max_value=1000, value=28)
+epochs = st.sidebar.number_input("Epochs", min_value=1, max_value=1000, value=2)
+mask_ratio = st.sidebar.slider("Masking Ratio", min_value=0.1, max_value=0.9, value=0.75, step=0.05)
+batch_idx = st.sidebar.number_input("Enter Batch Index", min_value=0, max_value=len(train_loader)-1, value=0)
+sample_indices_input = st.sidebar.text_input("Enter Sample Indices (comma-separated)", value="0,1,2,3,4")
+sample_indices = [int(idx.strip()) for idx in sample_indices_input.split(",") if idx.strip().isdigit()]
+sample_indices = [idx for idx in sample_indices if 0 <= idx < batch_size]
+
+# Helper functions
+def show_images(images, titles=None, num_images=5):
+    """Display a grid of images"""
+    fig, axes = plt.subplots(1, num_images, figsize=(15, 3))
+    for i in range(num_images):
+        ax = axes[i]
+        ax.imshow(images[i].squeeze(), cmap='gray')
+        ax.axis('off')
+        if titles is not None:
+            ax.set_title(titles[i])
+    st.pyplot(fig)
+
+def process_batch(batch_idx, sample_indices, loader=train_loader, mask_ratio=0.75):
+    """Select a batch and samples, apply patching and masking"""
+    for i, (images, labels) in enumerate(loader):
+        if i == batch_idx:
+            selected_batch = images
+            selected_labels = labels
+            break
+
+    selected_images = selected_batch[sample_indices]
+    selected_labels = selected_labels[sample_indices]
+
+    patches = rearrange(selected_images, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size)
+
+    batch_size, num_patches, _ = patches.shape
+    num_masked = int(mask_ratio * num_patches)
+
+    noise = torch.rand(batch_size, num_patches, device=patches.device)
+    ids_shuffle = torch.argsort(noise, dim=1)
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    ids_keep = ids_shuffle[:, :num_patches - num_masked]
+    ids_mask = ids_shuffle[:, num_patches - num_masked:]
+
+    patches_keep = torch.gather(patches, 1, ids_keep.unsqueeze(-1).repeat(1, 1, patches.shape[-1]))
+    patches_mask = torch.gather(patches, 1, ids_mask.unsqueeze(-1).repeat(1, 1, patches.shape[-1]))
+
+    mask = torch.ones(batch_size, num_patches, device=patches.device)
+    mask[:, :num_patches - num_masked] = 0
+    mask = torch.gather(mask, 1, ids_restore)
+
+    return selected_images, patches, patches_keep, patches_mask, mask, ids_restore, selected_labels
+
+# Model components
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=28, patch_size=7, in_chans=1, embed_dim=128):
         super().__init__()
-        self.resize = transforms.Resize((32 + 20, 32 + 20))
-        self.random_crop = transforms.RandomCrop((IMAGE_SIZE, IMAGE_SIZE))
-        self.random_flip = transforms.RandomHorizontalFlip()
-
-    def forward(self, x):
-        x = self.resize(x)
-        x = self.random_crop(x)
-        x = self.random_flip(x)
-        return x
-
-class TestAugmentation(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.resize = transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))
-
-    def forward(self, x):
-        x = self.resize(x)
-        return x
-
-# Patches Layer
-class Patches(nn.Module):
-    def __init__(self, patch_size=PATCH_SIZE):
-        super().__init__()
+        self.img_size = img_size
         self.patch_size = patch_size
-
-    def forward(self, images):
-        batch_size = images.shape[0]
-        patches = rearrange(images, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
-                            p1=self.patch_size, p2=self.patch_size)
-        return patches
-
-    def reconstruct_from_patch(self, patch):
-        num_patches = patch.shape[0]
-        n = int(np.sqrt(num_patches))
-        patch = patch.reshape(num_patches, self.patch_size, self.patch_size, 3)
-        rows = torch.chunk(patch, n, dim=0)
-        rows = [torch.cat(torch.unbind(x, dim=0), dim=1) for x in rows]
-        reconstructed = torch.cat(rows, dim=0)
-        return reconstructed
-
-# Patch Encoder
-class PatchEncoder(nn.Module):
-    def __init__(self, patch_size=PATCH_SIZE, projection_dim=ENC_PROJECTION_DIM,
-                 mask_proportion=MASK_PROPORTION, downstream=False):  # Make mask_proportion a parameter
-        super().__init__()
-        self.patch_size = patch_size
-        self.projection_dim = projection_dim
-        self.mask_proportion = mask_proportion  # Use the passed value
-        self.downstream = downstream
-
-        self.mask_token = nn.Parameter(torch.randn(1, patch_size * patch_size * 3))
-        self.projection = nn.Linear(patch_size * patch_size * 3, projection_dim)
-        self.position_embedding = nn.Embedding(NUM_PATCHES, projection_dim)
-
-    def forward(self, patches):
-        batch_size, num_patches, _ = patches.shape
-        self.num_mask = int(self.mask_proportion * num_patches)
-
-        positions = torch.arange(0, num_patches).unsqueeze(0).to(patches.device)
-        pos_embeddings = self.position_embedding(positions)
-        pos_embeddings = pos_embeddings.repeat(batch_size, 1, 1)
-
-        patch_embeddings = self.projection(patches) + pos_embeddings
-
-        if self.downstream:
-            return patch_embeddings
-        else:
-            rand_indices = torch.argsort(torch.rand(batch_size, num_patches, device=patches.device), dim=-1)
-            mask_indices = rand_indices[:, :self.num_mask]
-            unmask_indices = rand_indices[:, self.num_mask:]
-
-            unmasked_embeddings = torch.gather(patch_embeddings, 1,
-                                              unmask_indices.unsqueeze(-1).expand(-1, -1, self.projection_dim))
-            unmasked_positions = torch.gather(pos_embeddings, 1,
-                                             unmask_indices.unsqueeze(-1).expand(-1, -1, self.projection_dim))
-
-            masked_positions = torch.gather(pos_embeddings, 1,
-                                          mask_indices.unsqueeze(-1).expand(-1, -1, self.projection_dim))
-            mask_tokens = self.mask_token.repeat(batch_size, self.num_mask, 1)
-            masked_embeddings = self.projection(mask_tokens) + masked_positions
-
-            return (unmasked_embeddings, masked_embeddings,
-                    unmasked_positions, mask_indices, unmask_indices)
-
-    def generate_masked_image(self, patches, unmask_indices):
-        # Select first item in batch (since we're displaying one at a time)
-        patch = patches[0]  # Get first item in batch
-        unmask_index = unmask_indices[0]  # Get first item in batch
-        new_patch = torch.zeros_like(patch)
-        new_patch[unmask_index] = patch[unmask_index]
-        return new_patch, 0  # Return index 0 since we're working with first item
-
-# Encoder
-class Encoder(nn.Module):
-    def __init__(self, num_heads=ENC_NUM_HEADS, num_layers=ENC_LAYERS):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(nn.ModuleList([
-                nn.LayerNorm(ENC_PROJECTION_DIM, eps=LAYER_NORM_EPS),
-                nn.MultiheadAttention(ENC_PROJECTION_DIM, num_heads, dropout=0.1, batch_first=True),
-                nn.LayerNorm(ENC_PROJECTION_DIM, eps=LAYER_NORM_EPS),
-                nn.Sequential(
-                    nn.Linear(ENC_PROJECTION_DIM, ENC_TRANSFORMER_UNITS[0]),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(ENC_TRANSFORMER_UNITS[0], ENC_TRANSFORMER_UNITS[1]),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                )
-            ]))
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Linear(patch_size * patch_size * in_chans, embed_dim)
 
     def forward(self, x):
-        for norm1, attn, norm2, ff in self.layers:
-            x1 = norm1(x)
-            attn_output, _ = attn(x1, x1, x1)
-            x2 = x + attn_output
-            x3 = norm2(x2)
-            x3 = ff(x3)
-            x = x2 + x3
-        return x
-
-# Decoder
-class Decoder(nn.Module):
-    def __init__(self, num_layers=DEC_LAYERS, num_heads=DEC_NUM_HEADS, image_size=IMAGE_SIZE):
-        super().__init__()
-        self.proj = nn.Linear(ENC_PROJECTION_DIM, DEC_PROJECTION_DIM)
-        self.layers = nn.ModuleList()
-
-        for _ in range(num_layers):
-            self.layers.append(nn.ModuleList([
-                nn.LayerNorm(DEC_PROJECTION_DIM, eps=LAYER_NORM_EPS),
-                nn.MultiheadAttention(DEC_PROJECTION_DIM, num_heads, dropout=0.1, batch_first=True),
-                nn.LayerNorm(DEC_PROJECTION_DIM, eps=LAYER_NORM_EPS),
-                nn.Sequential(
-                    nn.Linear(DEC_PROJECTION_DIM, DEC_TRANSFORMER_UNITS[0]),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(DEC_TRANSFORMER_UNITS[0], DEC_TRANSFORMER_UNITS[1]),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                )
-            ]))
-
-        self.norm = nn.LayerNorm(DEC_PROJECTION_DIM, eps=LAYER_NORM_EPS)
-        self.head = nn.Sequential(
-            nn.Linear(DEC_PROJECTION_DIM * NUM_PATCHES, image_size * image_size * 3),
-            nn.Sigmoid()
-        )
-        self.image_size = image_size
-
-    def forward(self, x):
+        x = rearrange(x, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=self.patch_size, p2=self.patch_size)
         x = self.proj(x)
-
-        for norm1, attn, norm2, ff in self.layers:
-            x1 = norm1(x)
-            attn_output, _ = attn(x1, x1, x1)
-            x2 = x + attn_output
-            x3 = norm2(x2)
-            x3 = ff(x3)
-            x = x2 + x3
-
-        x = self.norm(x)
-        x = x.flatten(start_dim=1)
-        x = self.head(x)
-        x = x.view(-1, 3, self.image_size, self.image_size)
         return x
 
-# MAE Model
-class MaskedAutoencoder(nn.Module):
-    def __init__(self, train_augmentation, test_augmentation, patch_layer, patch_encoder, encoder, decoder):
+class PositionalEncoding(nn.Module):
+    def __init__(self, num_patches, embed_dim):
         super().__init__()
-        self.train_augmentation = train_augmentation
-        self.test_augmentation = test_augmentation
-        self.patch_layer = patch_layer
-        self.patch_encoder = patch_encoder
-        self.encoder = encoder
-        self.decoder = decoder
-
-    def calculate_loss(self, images, test=False):
-        if test:
-            augmented_images = self.test_augmentation(images)
-        else:
-            augmented_images = self.train_augmentation(images)
-
-        patches = self.patch_layer(augmented_images)
-        (unmasked_embeddings, masked_embeddings,
-         unmasked_positions, mask_indices, unmask_indices) = self.patch_encoder(patches)
-
-        encoder_outputs = self.encoder(unmasked_embeddings)
-        encoder_outputs = encoder_outputs + unmasked_positions
-        decoder_inputs = torch.cat([encoder_outputs, masked_embeddings], dim=1)
-        decoder_outputs = self.decoder(decoder_inputs)
-        decoder_patches = self.patch_layer(decoder_outputs)
-
-        loss_patch = torch.gather(patches, 1, mask_indices.unsqueeze(-1).expand(-1, -1, patches.shape[-1]))
-        loss_output = torch.gather(decoder_patches, 1, mask_indices.unsqueeze(-1).expand(-1, -1, decoder_patches.shape[-1]))
-
-        loss = F.mse_loss(loss_patch, loss_output)
-        mae = F.l1_loss(loss_patch, loss_output)
-
-        return loss, mae, loss_patch, loss_output, augmented_images, mask_indices, unmask_indices, decoder_outputs
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
 
     def forward(self, x):
-        return self.calculate_loss(x)
+        return x + self.pos_embed
 
-# In the main() function, update the sidebar controls section:
-def main():
-    # Streamlit app configuration
-    st.set_page_config(layout="wide")
-    st.title("Masked Autoencoder (MAE) with PyTorch")
+class MaskedAutoencoderViT(nn.Module):
+    def __init__(self, img_size=28, patch_size=7, in_chans=1, embed_dim=128, num_heads=4, num_layers=3, mask_ratio=0.75):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.embed_dim = embed_dim
+        self.mask_ratio = mask_ratio
 
-    # Sidebar controls
-    with st.sidebar:
-        st.header("Configuration")
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_chans, embed_dim)
+        self.pos_embed = PositionalEncoding(self.num_patches, embed_dim)
 
-        batch_size = st.slider("Batch Size", 32, 512, BATCH_SIZE, step=32) 
-        epochs = st.sidebar.number_input("Number of Epochs", min_value=1, max_value=1000, value=10)
-        
-        # Add slider for mask proportion
-        mask_proportion = st.slider("Masking Proportion", 
-                                  min_value=0.1, 
-                                  max_value=0.9, 
-                                  value=MASK_PROPORTION, 
-                                  step=0.05,
-                                  help="Proportion of patches to mask")
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=4*embed_dim, dropout=0.1, activation='gelu', batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        if st.button("Train Model"):
-            train_model = True
-        else:
-            train_model = False
+        decoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=4*embed_dim, dropout=0.1, activation='gelu', batch_first=True)
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=1)
 
-    # Data Loading
-    @st.cache_data
-    def load_data():
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
-        test_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform)
-        return train_dataset, test_dataset
+        self.head = nn.Linear(embed_dim, patch_size * patch_size * in_chans)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
 
-    train_dataset, test_dataset = load_data()
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        self.apply(self._init_weights)
 
-    # Initialize models - pass the mask_proportion from sidebar
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_augmentation = TrainAugmentation().to(device)
-    test_augmentation = TestAugmentation().to(device)
-    patch_layer = Patches().to(device)
-    patch_encoder = PatchEncoder(mask_proportion=mask_proportion).to(device)  # Updated here
-    encoder = Encoder().to(device)
-    decoder = Decoder().to(device)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
-    mae_model = MaskedAutoencoder(
-        train_augmentation, test_augmentation,
-        patch_layer, patch_encoder, encoder, decoder
-    ).to(device)
+    def random_masking(self, x):
+        B, N, D = x.shape
+        num_masked = int(self.mask_ratio * N)
 
+        noise = torch.rand(B, N, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-    optimizer = torch.optim.Adam(mae_model.parameters())
+        ids_keep = ids_shuffle[:, :N - num_masked]
+        ids_mask = ids_shuffle[:, N - num_masked:]
 
-    # Training and Visualization
-    if train_model:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        loss_history = []
-        mae_history = []
+        x_keep = torch.gather(x, 1, ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        mask_tokens = self.mask_token.repeat(B, num_masked, 1)
+        x_masked = torch.cat([x_keep, mask_tokens], dim=1)
+        x_masked = torch.gather(x_masked, 1, ids_restore.unsqueeze(-1).repeat(1, 1, D))
 
-        chart1, chart2 = st.columns(2)
-        with chart1:
-            loss_chart = st.line_chart()
-        with chart2:
-            mae_chart = st.line_chart()
+        mask = torch.ones(B, N, device=x.device)
+        mask[:, :N - num_masked] = 0
+        mask = torch.gather(mask, 1, ids_restore)
 
-        results_container = st.container()
+        return x_masked, mask, ids_restore
 
-        for epoch in range(epochs):
-            mae_model.train()
-            total_loss = 0
-            total_mae = 0
+    def forward_encoder(self, x):
+        x = self.patch_embed(x)
+        x = self.pos_embed(x)
+        x, mask, ids_restore = self.random_masking(x)
+        x = self.encoder(x)
+        return x, mask, ids_restore
 
-            for batch_idx, (images, _) in enumerate(train_loader):
-                images = images.to(device)
-                optimizer.zero_grad()
-                loss, mae, _, _, _, _, _, _ = mae_model.calculate_loss(images)
-                loss.backward()
-                optimizer.step()
+    def forward_decoder(self, x, ids_restore):
+        x = self.decoder(x)
+        pred = self.head(x)
+        pred = torch.gather(pred, 1, ids_restore.unsqueeze(-1).repeat(1, 1, pred.shape[-1]))
+        return pred
 
-                total_loss += loss.item()
-                total_mae += mae.item()
+    def forward(self, x):
+        latent, mask, ids_restore = self.forward_encoder(x)
+        pred = self.forward_decoder(latent, ids_restore)
+        return pred, mask
 
-                if batch_idx % 10 == 0:
-                    status_text.text(f"Epoch: {epoch+1}/{epochs}, Batch: {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}, MAE: {mae.item():.4f}")
-                    progress_bar.progress((epoch * len(train_loader) + batch_idx + 1) / (epochs * len(train_loader)))
+    def reconstruct(self, x):
+        pred, _ = self.forward(x)
+        pred = rearrange(pred, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)', h=self.img_size // self.patch_size, p1=self.patch_size, p2=self.patch_size)
+        return pred
 
-            avg_loss = total_loss / len(train_loader)
-            avg_mae = total_mae / len(train_loader)
-            loss_history.append(avg_loss)
-            mae_history.append(avg_mae)
+# Set model parameters and create model
+model = MaskedAutoencoderViT(
+    img_size=image_size,
+    patch_size=patch_size,
+    in_chans=1,
+    embed_dim=embed_dim,
+    num_heads=num_heads,
+    num_layers=num_layers,
+    mask_ratio=mask_ratio
+).to(device)
 
-            loss_chart.add_rows({"Loss": [avg_loss]})
-            mae_chart.add_rows({"MAE": [avg_mae]})
+# Loss function and optimizer
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(model.parameters(), lr=1e-3)
 
-            if (epoch + 1) % 5 == 0 or epoch == 0:
-                mae_model.eval()
-                with torch.no_grad():
-                    test_images, _ = next(iter(test_loader))
-                    test_images = test_images[:5].to(device)
-                    (_, _, _, _, augmented_images,
-                     mask_indices, unmask_indices, reconstructed_images) = mae_model.calculate_loss(test_images, test=True)
+# Training function
+def train_model(model, train_loader, val_loader, epochs):
+    train_losses = []
+    val_losses = []
 
-                    with results_container:
-                        st.subheader(f"Epoch {epoch+1} Results")
-                        cols = st.columns(5)
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
 
-                        for i in range(5):
-                            with cols[i]:
-                                orig_img = augmented_images[i].cpu().permute(1, 2, 0).numpy()
-                                st.image(orig_img, caption=f"Original {i+1}", use_container_width=True)
+        for images, _ in train_loader:
+            images = images.to(device)
+            pred, mask = model(images)
+            patches = rearrange(images, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size)
+            loss = criterion(pred[mask.bool()], patches[mask.bool()])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * images.size(0)
 
-                                patches = patch_layer(augmented_images[i].unsqueeze(0))
-                                masked_patch, _ = patch_encoder.generate_masked_image(patches, unmask_indices[i].unsqueeze(0))
-                                masked_img = patch_layer.reconstruct_from_patch(masked_patch).cpu().numpy()
-                                st.image(masked_img, caption=f"Masked {i+1}", use_container_width=True)
+        train_loss = train_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
 
-                                recon_img = reconstructed_images[i].cpu().permute(1, 2, 0).numpy()
-                                st.image(recon_img, caption=f"Reconstructed {i+1}", use_container_width=True)
+        model.eval()
+        val_loss = 0.0
 
-                mae_model.train()
-
-        mae_model.eval()
-        total_loss = 0
-        total_mae = 0
         with torch.no_grad():
-            for images, _ in test_loader:
+            for images, _ in val_loader:
                 images = images.to(device)
-                loss, mae, _, _, _, _, _, _ = mae_model.calculate_loss(images, test=True)
-                total_loss += loss.item()
-                total_mae += mae.item()
+                pred, mask = model(images)
+                patches = rearrange(images, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size)
+                loss = criterion(pred[mask.bool()], patches[mask.bool()])
+                val_loss += loss.item() * images.size(0)
 
-        avg_loss = total_loss / len(test_loader)
-        avg_mae = total_mae / len(test_loader)
+        val_loss = val_loss / len(val_loader.dataset)
+        val_losses.append(val_loss)
 
-        st.success(f"Training Complete!")
-        st.write(f"Final Test Loss: {avg_loss:.4f}")
-        st.write(f"Final Test MAE: {avg_mae:.4f}")
+        st.write(f'Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
 
-        if st.button("Save Model"):
-            torch.save(mae_model.state_dict(), "mae_model.pth")
-            st.success("Model saved as mae_model.pth")
+    return train_losses, val_losses
 
-    else:
-        st.subheader("Sample Data Visualization")
-        sample_images, _ = next(iter(train_loader))
-        sample_images = sample_images[:5]
+# Visualization functions
+def visualize_patching_masking(batch_idx, sample_indices, mask_ratio=0.75):
+    images, patches, patches_keep, patches_mask, mask, ids_restore, labels = process_batch(batch_idx, sample_indices, mask_ratio=mask_ratio)
+    images = images.cpu().numpy()
+    patches = patches.cpu().numpy()
+    mask = mask.cpu().numpy()
+    num_samples = len(sample_indices)
 
-        cols = st.columns(5)
-        for i in range(5):
-            with cols[i]:
-                img = sample_images[i].permute(1, 2, 0).numpy()
-                st.image(img, caption=f"Sample {i+1}", use_container_width=True)
+    st.write("Original Images:")
+    show_images(images[:num_samples], [f"Label: {labels[i]}" for i in range(num_samples)], num_samples)
 
-        st.write("Adjust the parameters in the sidebar and click 'Train Model' to start training.")
+    masked_patches = patches.copy()
+    for i in range(num_samples):
+        masked_patches[i, mask[i].astype(bool)] = 0
 
-if __name__ == '__main__':
-    main()
+    masked_recon = rearrange(masked_patches[:num_samples], 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)', h=image_size//patch_size, p1=patch_size, p2=patch_size)
+    st.write(f"Masked Images ({int(mask_ratio*100)}% patches masked):")
+    show_images(masked_recon[:num_samples], [f"Label: {labels[i]}" for i in range(num_samples)], num_samples)
+
+def visualize_reconstructed_images(model, batch_idx, sample_indices):
+    images, patches, patches_keep, patches_mask, mask, ids_restore, labels = process_batch(batch_idx, sample_indices)
+    images_np = images.cpu().numpy()
+    patches = patches.cpu().numpy()
+    mask = mask.cpu().numpy()
+    num_samples = len(sample_indices)
+
+    st.write("Original Images:")
+    show_images(images_np[:num_samples], [f"Label: {labels[i]}" for i in range(num_samples)], num_samples)
+
+    masked_patches = patches.copy()
+    for i in range(num_samples):
+        masked_patches[i, mask[i].astype(bool)] = 0
+
+    masked_recon = rearrange(masked_patches[:num_samples], 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)', h=image_size//patch_size, p1=patch_size, p2=patch_size)
+    st.write(f"Masked Images ({int(mask_ratio*100)}% patches masked):")
+    show_images(masked_recon[:num_samples], [f"Label: {labels[i]}" for i in range(num_samples)], num_samples)
+
+    images_tensor = torch.tensor(images_np[:num_samples]).to(device)
+    with torch.no_grad():
+        reconstructed_images = model.reconstruct(images_tensor).cpu().numpy()
+
+    st.write("Reconstructed Images After Training:")
+    show_images(reconstructed_images, [f"Label: {labels[i]}" for i in range(num_samples)], num_samples)
+
+def evaluate_model(model, loader):
+    model.eval()
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for images, _ in loader:
+            images = images.to(device)
+            pred, mask = model(images)
+            patches = rearrange(images, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size)
+            loss = criterion(pred[mask.bool()], patches[mask.bool()])
+            total_loss += loss.item() * images.size(0)
+
+    avg_loss = total_loss / len(loader.dataset)
+    return avg_loss
+
+if __name__ == "__main__":
+    st.write("Visualizing patching and masking process...")
+    visualize_patching_masking(batch_idx, sample_indices, mask_ratio)
+
+    st.write("Training the model...")
+    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs)
+
+    fig, ax = plt.subplots()
+    ax.plot(train_losses, label='Training Loss')
+    ax.plot(val_losses, label='Validation Loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training and Validation Loss')
+    ax.legend()
+    st.pyplot(fig)
+
+    test_loss = evaluate_model(model, test_loader)
+    st.write(f"Test Loss: {test_loss:.4f}")
+
+    official_test_loss = evaluate_model(model, official_test_loader)
+    st.write(f"Official Test Set Loss: {official_test_loss:.4f}")
+
+    st.write("Visualizing reconstructed images:")
+    visualize_reconstructed_images(model, batch_idx, sample_indices)
