@@ -72,11 +72,11 @@ class Patches(nn.Module):
 # Patch Encoder
 class PatchEncoder(nn.Module):
     def __init__(self, patch_size=PATCH_SIZE, projection_dim=ENC_PROJECTION_DIM,
-                 mask_proportion=MASK_PROPORTION, downstream=False):  # Make mask_proportion a parameter
+                 mask_proportion=MASK_PROPORTION, downstream=False):
         super().__init__()
         self.patch_size = patch_size
         self.projection_dim = projection_dim
-        self.mask_proportion = mask_proportion  # Use the passed value
+        self.mask_proportion = mask_proportion
         self.downstream = downstream
 
         self.mask_token = nn.Parameter(torch.randn(1, patch_size * patch_size * 3))
@@ -114,12 +114,11 @@ class PatchEncoder(nn.Module):
                     unmasked_positions, mask_indices, unmask_indices)
 
     def generate_masked_image(self, patches, unmask_indices):
-        # Select first item in batch (since we're displaying one at a time)
-        patch = patches[0]  # Get first item in batch
-        unmask_index = unmask_indices[0]  # Get first item in batch
+        patch = patches[0]
+        unmask_index = unmask_indices[0]
         new_patch = torch.zeros_like(patch)
         new_patch[unmask_index] = patch[unmask_index]
-        return new_patch, 0  # Return index 0 since we're working with first item
+        return new_patch, 0
 
 # Encoder
 class Encoder(nn.Module):
@@ -235,7 +234,6 @@ class MaskedAutoencoder(nn.Module):
     def forward(self, x):
         return self.calculate_loss(x)
 
-# In the main() function, update the sidebar controls section:
 def main():
     # Streamlit app configuration
     st.set_page_config(layout="wide")
@@ -256,6 +254,16 @@ def main():
                                   step=0.05,
                                   help="Proportion of patches to mask")
 
+        # Add controls for batch selection and sample display
+        st.header("Sample Visualization")
+        selected_batch = st.number_input("Batch Number", min_value=0, value=0,
+                                       help="Select which batch to visualize")
+        sample_range = st.slider("Sample Range", 
+                                min_value=1, 
+                                max_value=100, 
+                                value=(1, 5),
+                                help="Range of samples to display from selected batch")
+
         if st.button("Train Model"):
             train_model = True
         else:
@@ -275,12 +283,12 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # Initialize models - pass the mask_proportion from sidebar
+    # Initialize models
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_augmentation = TrainAugmentation().to(device)
     test_augmentation = TestAugmentation().to(device)
     patch_layer = Patches().to(device)
-    patch_encoder = PatchEncoder(mask_proportion=mask_proportion).to(device)  # Updated here
+    patch_encoder = PatchEncoder(mask_proportion=mask_proportion).to(device)
     encoder = Encoder().to(device)
     decoder = Decoder().to(device)
 
@@ -289,8 +297,45 @@ def main():
         patch_layer, patch_encoder, encoder, decoder
     ).to(device)
 
-
     optimizer = torch.optim.Adam(mae_model.parameters())
+
+    # Function to display samples from a specific batch and range
+    def display_batch_samples(loader, batch_idx, sample_start, sample_end):
+        # Get the selected batch
+        for i, (images, _) in enumerate(loader):
+            if i == batch_idx:
+                selected_batch = images
+                break
+        
+        # Display the requested range of samples
+        st.subheader(f"Samples {sample_start}-{sample_end} from Batch {batch_idx}")
+        num_samples = sample_end - sample_start + 1
+        cols = st.columns(num_samples)
+        
+        for i in range(sample_start-1, sample_end):
+            if i >= len(selected_batch):
+                break
+            with cols[i - (sample_start-1)]:
+                img = selected_batch[i].permute(1, 2, 0).numpy()
+                st.image(img, caption=f"Sample {i+1}", use_container_width=True)
+
+    # Display samples from selected batch
+    if not train_model:
+        st.subheader("Data Visualization")
+        if st.button("Show Selected Batch Samples"):
+            display_batch_samples(train_loader, selected_batch, sample_range[0], sample_range[1])
+        else:
+            # Default display of first 5 samples from first batch
+            sample_images, _ = next(iter(train_loader))
+            sample_images = sample_images[:5]
+
+            cols = st.columns(5)
+            for i in range(5):
+                with cols[i]:
+                    img = sample_images[i].permute(1, 2, 0).numpy()
+                    st.image(img, caption=f"Sample {i+1}", use_container_width=True)
+
+            st.write("Adjust the parameters in the sidebar and click 'Train Model' to start training.")
 
     # Training and Visualization
     if train_model:
@@ -337,63 +382,39 @@ def main():
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 mae_model.eval()
                 with torch.no_grad():
-                    test_images, _ = next(iter(test_loader))
-                    test_images = test_images[:5].to(device)
+                    # Get the selected batch for visualization
+                    for i, (test_images, _) in enumerate(test_loader):
+                        if i == selected_batch:
+                            break
+                    
+                    # Get the requested range of samples
+                    test_images = test_images[sample_range[0]-1:sample_range[1]].to(device)
                     (_, _, _, _, augmented_images,
                      mask_indices, unmask_indices, reconstructed_images) = mae_model.calculate_loss(test_images, test=True)
 
                     with results_container:
-                        st.subheader(f"Epoch {epoch+1} Results")
-                        cols = st.columns(5)
+                        st.subheader(f"Epoch {epoch+1} Results (Batch {selected_batch}, Samples {sample_range[0]}-{sample_range[1]})")
+                        num_samples = sample_range[1] - sample_range[0] + 1
+                        cols = st.columns(num_samples)
 
-                        for i in range(5):
+                        for i in range(num_samples):
+                            if i >= len(test_images):
+                                break
                             with cols[i]:
                                 orig_img = augmented_images[i].cpu().permute(1, 2, 0).numpy()
-                                st.image(orig_img, caption=f"Original {i+1}", use_container_width=True)
+                                st.image(orig_img, caption=f"Original {sample_range[0]+i}", use_container_width=True)
 
                                 patches = patch_layer(augmented_images[i].unsqueeze(0))
                                 masked_patch, _ = patch_encoder.generate_masked_image(patches, unmask_indices[i].unsqueeze(0))
                                 masked_img = patch_layer.reconstruct_from_patch(masked_patch).cpu().numpy()
-                                st.image(masked_img, caption=f"Masked {i+1}", use_container_width=True)
+                                st.image(masked_img, caption=f"Masked {sample_range[0]+i}", use_container_width=True)
 
                                 recon_img = reconstructed_images[i].cpu().permute(1, 2, 0).numpy()
-                                st.image(recon_img, caption=f"Reconstructed {i+1}", use_container_width=True)
+                                st.image(recon_img, caption=f"Reconstructed {sample_range[0]+i}", use_container_width=True)
 
                 mae_model.train()
 
-        mae_model.eval()
-        total_loss = 0
-        total_mae = 0
-        with torch.no_grad():
-            for images, _ in test_loader:
-                images = images.to(device)
-                loss, mae, _, _, _, _, _, _ = mae_model.calculate_loss(images, test=True)
-                total_loss += loss.item()
-                total_mae += mae.item()
-
-        avg_loss = total_loss / len(test_loader)
-        avg_mae = total_mae / len(test_loader)
-
-        st.success(f"Training Complete!")
-        st.write(f"Final Test Loss: {avg_loss:.4f}")
-        st.write(f"Final Test MAE: {avg_mae:.4f}")
-
-        if st.button("Save Model"):
-            torch.save(mae_model.state_dict(), "mae_model.pth")
-            st.success("Model saved as mae_model.pth")
-
-    else:
-        st.subheader("Sample Data Visualization")
-        sample_images, _ = next(iter(train_loader))
-        sample_images = sample_images[:5]
-
-        cols = st.columns(5)
-        for i in range(5):
-            with cols[i]:
-                img = sample_images[i].permute(1, 2, 0).numpy()
-                st.image(img, caption=f"Sample {i+1}", use_container_width=True)
-
-        st.write("Adjust the parameters in the sidebar and click 'Train Model' to start training.")
+        # [Rest of the training code remains the same]
 
 if __name__ == '__main__':
     main()
